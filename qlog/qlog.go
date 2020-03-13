@@ -1,16 +1,20 @@
 package qlog
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/congestion"
-
 	"github.com/francoispqt/gojay"
+
+	"github.com/lucas-clemente/quic-go/internal/congestion"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
 	"github.com/lucas-clemente/quic-go/internal/wire"
 )
+
+const eventChanSize = 50
 
 // A Tracer records events to be exported to a qlog.
 type Tracer interface {
@@ -32,35 +36,71 @@ type tracer struct {
 	odcid       protocol.ConnectionID
 	perspective protocol.Perspective
 
-	events []event
+	suffix     []byte
+	events     chan event
+	encodeErr  error
+	runStopped chan struct{}
 }
 
 var _ Tracer = &tracer{}
 
 // NewTracer creates a new tracer to record a qlog.
 func NewTracer(w io.WriteCloser, p protocol.Perspective, odcid protocol.ConnectionID) Tracer {
-	return &tracer{
+	t := &tracer{
 		w:           w,
 		perspective: p,
 		odcid:       odcid,
+		runStopped:  make(chan struct{}),
+		events:      make(chan event, eventChanSize),
 	}
+	go t.run()
+	return t
 }
 
-func (t *tracer) Active() bool { return true }
-
-// Export writes a qlog.
-func (t *tracer) Export() error {
-	enc := gojay.NewEncoder(t.w)
+func (t *tracer) run() {
+	defer close(t.runStopped)
+	buf := &bytes.Buffer{}
+	enc := gojay.NewEncoder(buf)
 	tl := &topLevel{
 		traces: traces{
 			{
 				VantagePoint: vantagePoint{Type: t.perspective},
 				CommonFields: commonFields{ODCID: connectionID(t.odcid), GroupID: connectionID(t.odcid)},
 				EventFields:  eventFields[:],
-				Events:       t.events,
 			},
 		}}
 	if err := enc.Encode(tl); err != nil {
+		panic(fmt.Sprintf("qlog encoding into a bytes.Buffer failed: %s", err))
+	}
+	data := buf.Bytes()
+	t.suffix = data[buf.Len()-4:]
+	if _, err := t.w.Write(data[:buf.Len()-4]); err != nil {
+		t.encodeErr = err
+	}
+	enc = gojay.NewEncoder(t.w)
+	isFirst := true
+	for ev := range t.events {
+		if t.encodeErr != nil { // if encoding failed, just continue draining the event channel
+			continue
+		}
+		if !isFirst {
+			t.w.Write([]byte(","))
+		}
+		if err := enc.Encode(ev); err != nil {
+			t.encodeErr = err
+		}
+		isFirst = false
+	}
+}
+
+// Export writes a qlog.
+func (t *tracer) Export() error {
+	close(t.events)
+	<-t.runStopped
+	if t.encodeErr != nil {
+		return t.encodeErr
+	}
+	if _, err := t.w.Write(t.suffix); err != nil {
 		return err
 	}
 	return t.w.Close()
@@ -76,7 +116,7 @@ func (t *tracer) StartedConnection(time time.Time, local, remote net.Addr, versi
 	if !ok {
 		return
 	}
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventConnectionStarted{
 			SrcAddr:          localAddr,
@@ -85,7 +125,7 @@ func (t *tracer) StartedConnection(time time.Time, local, remote net.Addr, versi
 			SrcConnectionID:  srcConnID,
 			DestConnectionID: destConnID,
 		},
-	})
+	}
 }
 
 func (t *tracer) SentPacket(time time.Time, hdr *wire.ExtendedHeader, packetSize protocol.ByteCount, ack *wire.AckFrame, frames []wire.Frame) {
@@ -102,14 +142,14 @@ func (t *tracer) SentPacket(time time.Time, hdr *wire.ExtendedHeader, packetSize
 	}
 	header := *transformExtendedHeader(hdr)
 	header.PacketSize = packetSize
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventPacketSent{
 			PacketType: PacketTypeFromHeader(&hdr.Header),
 			Header:     header,
 			Frames:     fs,
 		},
-	})
+	}
 }
 
 func (t *tracer) ReceivedPacket(time time.Time, hdr *wire.ExtendedHeader, packetSize protocol.ByteCount, frames []wire.Frame) {
@@ -119,34 +159,34 @@ func (t *tracer) ReceivedPacket(time time.Time, hdr *wire.ExtendedHeader, packet
 	}
 	header := *transformExtendedHeader(hdr)
 	header.PacketSize = packetSize
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventPacketReceived{
 			PacketType: PacketTypeFromHeader(&hdr.Header),
 			Header:     header,
 			Frames:     fs,
 		},
-	})
+	}
 }
 
 func (t *tracer) ReceivedRetry(time time.Time, hdr *wire.Header) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventRetryReceived{
 			Header: *transformHeader(hdr),
 		},
-	})
+	}
 }
 
 func (t *tracer) BufferedPacket(time time.Time, packetType PacketType) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time:         time,
 		eventDetails: eventPacketBuffered{PacketType: packetType},
-	})
+	}
 }
 
 func (t *tracer) UpdatedMetrics(time time.Time, rttStats *congestion.RTTStats, cwnd, bytesInFlight protocol.ByteCount, packetsInFlight int) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventMetricsUpdated{
 			MinRTT:           rttStats.MinRTT(),
@@ -157,35 +197,35 @@ func (t *tracer) UpdatedMetrics(time time.Time, rttStats *congestion.RTTStats, c
 			BytesInFlight:    bytesInFlight,
 			PacketsInFlight:  packetsInFlight,
 		},
-	})
+	}
 }
 
 func (t *tracer) LostPacket(time time.Time, encLevel protocol.EncryptionLevel, pn protocol.PacketNumber, lossReason PacketLossReason) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventPacketLost{
 			PacketType:   getPacketTypeFromEncryptionLevel(encLevel),
 			PacketNumber: pn,
 			Trigger:      lossReason,
 		},
-	})
+	}
 }
 
 func (t *tracer) UpdatedPTOCount(time time.Time, value uint32) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time:         time,
 		eventDetails: eventUpdatedPTO{Value: value},
-	})
+	}
 }
 
 func (t *tracer) UpdatedKeyFromTLS(time time.Time, encLevel protocol.EncryptionLevel, pers protocol.Perspective) {
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventKeyUpdated{
 			Trigger: keyUpdateTLS,
 			KeyType: encLevelToKeyType(encLevel, pers),
 		},
-	})
+	}
 }
 
 func (t *tracer) UpdatedKey(time time.Time, generation protocol.KeyPhase, remote bool) {
@@ -193,20 +233,20 @@ func (t *tracer) UpdatedKey(time time.Time, generation protocol.KeyPhase, remote
 	if remote {
 		trigger = keyUpdateRemote
 	}
-	t.events = append(t.events, event{
+	t.events <- event{
 		Time: time,
 		eventDetails: eventKeyUpdated{
 			Trigger:    trigger,
 			KeyType:    keyTypeClient1RTT,
 			Generation: generation,
 		},
-	})
-	t.events = append(t.events, event{
+	}
+	t.events <- event{
 		Time: time,
 		eventDetails: eventKeyUpdated{
 			Trigger:    trigger,
 			KeyType:    keyTypeServer1RTT,
 			Generation: generation,
 		},
-	})
+	}
 }
